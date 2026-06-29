@@ -716,6 +716,29 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 	if base == nil {
 		base = cfg.HTTPTransport()
 	}
+
+	// GRAFANA_DIAL_ADDR overrides only the TCP socket destination: every
+	// connection is dialed to this host:port instead of the host in the request
+	// URL, while the URL, Host header, TLS ServerName (SNI) and certificate
+	// verification all stay derived from the real GRAFANA_URL. This is the
+	// connector case: GRAFANA_URL stays the real https://grafana.internal host
+	// (so TLS verifies end-to-end) but the socket lands on the loopback tunnel
+	// proxy (127.0.0.1:PORT). We clone before mutating so shared base transports
+	// (http.DefaultTransport, prometheus' DefaultRoundTripper) are left intact.
+	if dialAddr := os.Getenv("GRAFANA_DIAL_ADDR"); dialAddr != "" {
+		if t, ok := base.(*http.Transport); ok {
+			t = t.Clone()
+			inner := t.DialContext
+			if inner == nil {
+				inner = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+			}
+			t.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return inner(ctx, network, dialAddr)
+			}
+			base = t
+		}
+	}
+
 	transport := base
 
 	// TLS
