@@ -2210,17 +2210,17 @@ func TestExtractGrafanaInfoFromHeadersDialAddr(t *testing.T) {
 		require.Equal(t, "127.0.0.1:39001", cfg.DialAddr)
 	})
 
-	t.Run("no header falls back to env", func(t *testing.T) {
+	t.Run("no header does not fall back to env", func(t *testing.T) {
 		t.Setenv("GRAFANA_DIAL_ADDR", "127.0.0.1:39002")
 		req, err := http.NewRequest("GET", "http://localhost", nil)
 		require.NoError(t, err)
 
 		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
 		cfg := GrafanaConfigFromContext(ctx)
-		require.Equal(t, "127.0.0.1:39002", cfg.DialAddr)
+		require.Equal(t, "", cfg.DialAddr)
 	})
 
-	t.Run("header wins over env", func(t *testing.T) {
+	t.Run("header set", func(t *testing.T) {
 		t.Setenv("GRAFANA_DIAL_ADDR", "127.0.0.1:39002")
 		req, err := http.NewRequest("GET", "http://localhost", nil)
 		require.NoError(t, err)
@@ -2230,6 +2230,14 @@ func TestExtractGrafanaInfoFromHeadersDialAddr(t *testing.T) {
 		cfg := GrafanaConfigFromContext(ctx)
 		require.Equal(t, "127.0.0.1:39001", cfg.DialAddr)
 	})
+}
+
+func TestExtractGrafanaInfoFromEnvDialAddr(t *testing.T) {
+	t.Setenv("GRAFANA_DIAL_ADDR", "127.0.0.1:39003")
+
+	ctx := ExtractGrafanaInfoFromEnv(context.Background())
+	cfg := GrafanaConfigFromContext(ctx)
+	require.Equal(t, "127.0.0.1:39003", cfg.DialAddr)
 }
 
 func TestBuildTransportConfigDialAddr(t *testing.T) {

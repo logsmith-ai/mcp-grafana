@@ -725,7 +725,8 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 		base = cfg.HTTPTransport()
 	}
 
-	// cfg.DialAddr (from X-Grafana-Dial-Addr header) or GRAFANA_DIAL_ADDR env var
+	// cfg.DialAddr (set from the X-Grafana-Dial-Addr header on HTTP transports, or
+	// from the GRAFANA_DIAL_ADDR env var via ExtractGrafanaInfoFromEnv on stdio)
 	// overrides only the TCP socket destination: every connection is dialed to this
 	// host:port instead of the host in the request URL, while the URL, Host header,
 	// TLS ServerName (SNI) and certificate verification all stay derived from the
@@ -735,9 +736,6 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 	// so shared base transports (http.DefaultTransport, prometheus' DefaultRoundTripper)
 	// are left intact.
 	dialAddr := cfg.DialAddr
-	if dialAddr == "" {
-		dialAddr = os.Getenv("GRAFANA_DIAL_ADDR")
-	}
 	if dialAddr != "" {
 		if t, ok := base.(*http.Transport); ok {
 			t = t.Clone()
@@ -846,12 +844,12 @@ func extractKeyGrafanaInfoFromReq(req *http.Request, logger *slog.Logger) (grafa
 }
 
 // dialAddrFromReq returns the per-request socket dial override: the
-// X-Grafana-Dial-Addr header when present, else the GRAFANA_DIAL_ADDR env var.
+// X-Grafana-Dial-Addr header value, or empty if absent. It intentionally does
+// not fall back to the GRAFANA_DIAL_ADDR env var — on a shared multi-tenant
+// server a process-wide env var must never leak into a request that didn't
+// ask for it.
 func dialAddrFromReq(req *http.Request) string {
-	if addr := req.Header.Get(grafanaDialAddrHeader); addr != "" {
-		return addr
-	}
-	return os.Getenv("GRAFANA_DIAL_ADDR")
+	return req.Header.Get(grafanaDialAddrHeader)
 }
 
 // ExtractGrafanaInfoFromEnv is a StdioContextFunc that extracts Grafana configuration from environment variables.
