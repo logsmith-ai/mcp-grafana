@@ -1,6 +1,7 @@
 package mcpgrafana
 
 import (
+	"net/http"
 	"net/url"
 	"sync"
 	"testing"
@@ -140,11 +141,11 @@ func TestClientCache_DifferentCredentials(t *testing.T) {
 }
 
 func TestCacheKeyFromRequest(t *testing.T) {
-	key1 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, nil)
-	key2 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, nil)
+	key1 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", nil)
+	key2 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", nil)
 	assert.Equal(t, key1, key2)
 
-	key3 := cacheKeyFromRequest("http://localhost:3000", "key1", url.UserPassword("admin", "pass"), 1, nil)
+	key3 := cacheKeyFromRequest("http://localhost:3000", "key1", url.UserPassword("admin", "pass"), 1, "", nil)
 	assert.NotEqual(t, key1, key3)
 
 	assert.Equal(t, "admin", key3.username)
@@ -171,4 +172,16 @@ func TestClientCache_Close(t *testing.T) {
 	g, i, _ = cache.Size()
 	assert.Equal(t, 0, g)
 	assert.Equal(t, 0, i)
+}
+
+func TestCacheKeyIncludesDialAddr(t *testing.T) {
+	req, err := http.NewRequest("GET", "http://localhost", nil)
+	require.NoError(t, err)
+
+	k1 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", req)
+	k2 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39002", req)
+	k3 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", req)
+
+	require.NotEqual(t, k1, k2, "different dial addrs must produce different cache keys")
+	require.Equal(t, k1, k3, "same dial addr must produce the same cache key")
 }

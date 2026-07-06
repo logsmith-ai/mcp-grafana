@@ -27,15 +27,17 @@ type clientCacheKey struct {
 	username         string
 	password         string
 	orgID            int64
+	dialAddr         string
 	forwardedHeaders string // sorted, serialized forwarded headers for cache differentiation
 }
 
 // cacheKeyFromRequest builds a clientCacheKey from request-derived credentials and forwarded headers.
-func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64, req *http.Request) clientCacheKey {
+func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64, dialAddr string, req *http.Request) clientCacheKey {
 	key := clientCacheKey{
-		url:    grafanaURL,
-		apiKey: apiKey,
-		orgID:  orgID,
+		url:      grafanaURL,
+		apiKey:   apiKey,
+		orgID:    orgID,
+		dialAddr: dialAddr,
 	}
 	if basicAuth != nil {
 		key.username = basicAuth.Username()
@@ -335,7 +337,7 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 		}
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, req)
 
 		grafanaClient := cache.GetOrCreateGrafanaClient(key, func() *GrafanaClient {
 			logger.Debug("Creating new Grafana client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
@@ -353,7 +355,7 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 		logger := config.LoggerOrDefault()
 
 		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, req)
+		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, config.DialAddr, req)
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
@@ -382,7 +384,7 @@ func extractKubernetesClientCached(cache *ClientCache) httpContextFunc {
 		logger := config.LoggerOrDefault()
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, req)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, req)
 
 		k8sClient := cache.GetOrCreateK8sClient(key, func() *KubernetesClient {
 			logger.Debug("Creating new Kubernetes client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
