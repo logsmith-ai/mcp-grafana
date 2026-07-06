@@ -50,6 +50,7 @@ const (
 	grafanaURLHeader                 = "X-Grafana-URL"
 	grafanaServiceAccountTokenHeader = "X-Grafana-Service-Account-Token"
 	grafanaAPIKeyHeader              = "X-Grafana-API-Key" // Deprecated: use X-Grafana-Service-Account-Token instead
+	grafanaDialAddrHeader            = "X-Grafana-Dial-Addr"
 )
 
 func urlAndAPIKeyFromEnv(logger *slog.Logger) (string, string) {
@@ -254,6 +255,13 @@ type GrafanaConfig struct {
 	// It comes from the `X-Grafana-Id` header sent from Grafana to plugin backends.
 	// It is used for on-behalf-of auth in Grafana Cloud.
 	IDToken string
+
+	// DialAddr, when set, overrides only the TCP socket destination (host:port)
+	// for Grafana requests, while the URL, Host header, TLS ServerName (SNI) and
+	// certificate verification stay derived from URL. This is the per-request
+	// (multi-tenant) analogue of the GRAFANA_DIAL_ADDR environment variable and
+	// is populated from the X-Grafana-Dial-Addr header on HTTP transports.
+	DialAddr string
 
 	// TLSConfig holds TLS configuration for all Grafana clients.
 	TLSConfig *TLSConfig
@@ -717,15 +725,20 @@ func BuildTransport(cfg *GrafanaConfig, base http.RoundTripper, opts ...Transpor
 		base = cfg.HTTPTransport()
 	}
 
-	// GRAFANA_DIAL_ADDR overrides only the TCP socket destination: every
-	// connection is dialed to this host:port instead of the host in the request
-	// URL, while the URL, Host header, TLS ServerName (SNI) and certificate
-	// verification all stay derived from the real GRAFANA_URL. This is the
-	// connector case: GRAFANA_URL stays the real https://grafana.internal host
-	// (so TLS verifies end-to-end) but the socket lands on the loopback tunnel
-	// proxy (127.0.0.1:PORT). We clone before mutating so shared base transports
-	// (http.DefaultTransport, prometheus' DefaultRoundTripper) are left intact.
-	if dialAddr := os.Getenv("GRAFANA_DIAL_ADDR"); dialAddr != "" {
+	// cfg.DialAddr (from X-Grafana-Dial-Addr header) or GRAFANA_DIAL_ADDR env var
+	// overrides only the TCP socket destination: every connection is dialed to this
+	// host:port instead of the host in the request URL, while the URL, Host header,
+	// TLS ServerName (SNI) and certificate verification all stay derived from the
+	// real GRAFANA_URL. This is the connector case: GRAFANA_URL stays the real
+	// https://grafana.internal host (so TLS verifies end-to-end) but the socket
+	// lands on the loopback tunnel proxy (127.0.0.1:PORT). We clone before mutating
+	// so shared base transports (http.DefaultTransport, prometheus' DefaultRoundTripper)
+	// are left intact.
+	dialAddr := cfg.DialAddr
+	if dialAddr == "" {
+		dialAddr = os.Getenv("GRAFANA_DIAL_ADDR")
+	}
+	if dialAddr != "" {
 		if t, ok := base.(*http.Transport); ok {
 			t = t.Clone()
 			inner := t.DialContext
@@ -832,6 +845,15 @@ func extractKeyGrafanaInfoFromReq(req *http.Request, logger *slog.Logger) (grafa
 	return
 }
 
+// dialAddrFromReq returns the per-request socket dial override: the
+// X-Grafana-Dial-Addr header when present, else the GRAFANA_DIAL_ADDR env var.
+func dialAddrFromReq(req *http.Request) string {
+	if addr := req.Header.Get(grafanaDialAddrHeader); addr != "" {
+		return addr
+	}
+	return os.Getenv("GRAFANA_DIAL_ADDR")
+}
+
 // ExtractGrafanaInfoFromEnv is a StdioContextFunc that extracts Grafana configuration from environment variables.
 // It reads GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN (or deprecated GRAFANA_API_KEY) environment variables and adds the configuration to the context for use by Grafana clients.
 var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context) context.Context {
@@ -853,6 +875,7 @@ var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
+	config.DialAddr = os.Getenv("GRAFANA_DIAL_ADDR")
 	config.ExtraHeaders = extraHeaders
 	return WithGrafanaConfig(ctx, config)
 }
@@ -877,6 +900,7 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.APIKey = apiKey
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
+	config.DialAddr = dialAddrFromReq(req)
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
 	return WithGrafanaConfig(ctx, config)
 }

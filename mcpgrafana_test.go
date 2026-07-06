@@ -3,6 +3,7 @@ package mcpgrafana
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -2196,4 +2197,61 @@ func TestBuildTransportContextOverrides(t *testing.T) {
 		assert.Equal(t, "10", capturedReq.Header.Get(grafana_client.OrgIDHeader))
 		assert.Equal(t, "val", capturedReq.Header.Get("X-Custom"))
 	})
+}
+
+func TestExtractGrafanaInfoFromHeadersDialAddr(t *testing.T) {
+	t.Run("header sets DialAddr", func(t *testing.T) {
+		req, err := http.NewRequest("GET", "http://localhost", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Grafana-Dial-Addr", "127.0.0.1:39001")
+
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		cfg := GrafanaConfigFromContext(ctx)
+		require.Equal(t, "127.0.0.1:39001", cfg.DialAddr)
+	})
+
+	t.Run("no header falls back to env", func(t *testing.T) {
+		t.Setenv("GRAFANA_DIAL_ADDR", "127.0.0.1:39002")
+		req, err := http.NewRequest("GET", "http://localhost", nil)
+		require.NoError(t, err)
+
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		cfg := GrafanaConfigFromContext(ctx)
+		require.Equal(t, "127.0.0.1:39002", cfg.DialAddr)
+	})
+
+	t.Run("header wins over env", func(t *testing.T) {
+		t.Setenv("GRAFANA_DIAL_ADDR", "127.0.0.1:39002")
+		req, err := http.NewRequest("GET", "http://localhost", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Grafana-Dial-Addr", "127.0.0.1:39001")
+
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		cfg := GrafanaConfigFromContext(ctx)
+		require.Equal(t, "127.0.0.1:39001", cfg.DialAddr)
+	})
+}
+
+func TestBuildTransportConfigDialAddr(t *testing.T) {
+	// A real HTTP server on loopback plays the "tunnel proxy". The request URL
+	// points at a host that does not exist; if the response comes back, the
+	// socket was dialed to cfg.DialAddr.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("dialed-via-override"))
+	}))
+	defer srv.Close()
+	dialAddr := strings.TrimPrefix(srv.URL, "http://")
+
+	cfg := &GrafanaConfig{DialAddr: dialAddr}
+	rt, err := BuildTransport(cfg, nil, WithoutAuth(), WithoutOrgID())
+	require.NoError(t, err)
+
+	req, err := http.NewRequest("GET", "http://grafana.does-not-resolve.internal/", nil)
+	require.NoError(t, err)
+	resp, err := rt.RoundTrip(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "dialed-via-override", string(body))
 }
