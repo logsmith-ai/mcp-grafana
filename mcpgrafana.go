@@ -1255,6 +1255,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 						OrgID:        config.OrgID,
 						TLSConfig:    config.TLSConfig,
 						ExtraHeaders: config.ExtraHeaders,
+						DialAddr:     config.DialAddr,
 						Debug:        config.Debug,
 						Logger:       config.Logger,
 					}

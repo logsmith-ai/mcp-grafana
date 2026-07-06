@@ -1577,6 +1577,31 @@ func TestNewGrafanaClientOrgIDTransport(t *testing.T) {
 	})
 }
 
+func TestNewGrafanaClientHonorsDialAddr(t *testing.T) {
+	// A real HTTP server on loopback plays the "tunnel proxy". The client is
+	// built against a host that does not resolve; if the request arrives at
+	// the loopback server, the DialAddr from the CONTEXT config made it
+	// through NewGrafanaClient's oboConfig into the client's transport.
+	var gotRequest bool
+	ts := newTestHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotRequest = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[]`))
+	})
+	dialAddr := strings.TrimPrefix(ts.URL, "http://")
+
+	ctx := WithGrafanaConfig(context.Background(), GrafanaConfig{
+		DialAddr: dialAddr,
+	})
+	c := NewGrafanaClient(ctx, "http://grafana.does-not-resolve.internal", "test-key", nil)
+	require.NotNil(t, c)
+
+	// Make a real request through the client
+	_, err := c.Search.Search(nil, nil)
+	require.NoError(t, err)
+	require.True(t, gotRequest, "request must be dialed to the DialAddr loopback server")
+}
+
 func newTestHTTPServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(handler)
