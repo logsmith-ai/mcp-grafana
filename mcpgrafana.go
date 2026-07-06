@@ -1283,6 +1283,7 @@ func NewGrafanaClient(ctx context.Context, grafanaURL, apiKey string, auth *url.
 		IDToken:      config.IDToken,
 		TLSConfig:    config.TLSConfig,
 		ExtraHeaders: config.ExtraHeaders,
+		DialAddr:     config.DialAddr,
 		Logger:       config.Logger,
 	}
 	publicURL := fetchPublicURL(ctx, fetchCfg)
