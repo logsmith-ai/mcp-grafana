@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,6 +52,7 @@ const (
 	grafanaServiceAccountTokenHeader = "X-Grafana-Service-Account-Token"
 	grafanaAPIKeyHeader              = "X-Grafana-API-Key" // Deprecated: use X-Grafana-Service-Account-Token instead
 	grafanaDialAddrHeader            = "X-Grafana-Dial-Addr"
+	grafanaCAPemHeader               = "X-Grafana-CA-Pem"
 )
 
 func urlAndAPIKeyFromEnv(logger *slog.Logger) (string, string) {
@@ -215,9 +217,13 @@ type grafanaConfigKey struct{}
 // TLSConfig holds TLS configuration for Grafana clients.
 // It supports mutual TLS authentication with client certificates, custom CA certificates for server verification, and development options like skipping certificate verification.
 type TLSConfig struct {
-	CertFile   string
-	KeyFile    string
-	CAFile     string
+	CertFile string
+	KeyFile  string
+	CAFile   string
+	// CAPem is an inline PEM CA bundle, used in addition to CAFile. It carries a
+	// per-request (multi-tenant) CA — populated from the X-Grafana-CA-Pem header —
+	// without writing a temp file to disk.
+	CAPem      string
 	SkipVerify bool
 }
 
@@ -412,15 +418,30 @@ func (tc *TLSConfig) CreateTLSConfig() (*tls.Config, error) {
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-	// Load CA certificate if provided
-	if tc.CAFile != "" {
-		caCert, err := os.ReadFile(tc.CAFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+	// Load CA certificates if provided. The pool is seeded from the system roots
+	// and the custom CAs are APPENDED, never used as a replacement: on a shared
+	// multi-tenant server one tenant's private CA must not stop every public-CA
+	// tenant from verifying its Grafana.
+	if tc.CAFile != "" || tc.CAPem != "" {
+		caCertPool, err := x509.SystemCertPool()
+		if err != nil || caCertPool == nil {
+			// No usable system roots (e.g. Windows): fall back to a pool holding
+			// only the custom CAs.
+			caCertPool = x509.NewCertPool()
 		}
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse CA certificate")
+		if tc.CAFile != "" {
+			caCert, err := os.ReadFile(tc.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read CA certificate: %w", err)
+			}
+			if !caCertPool.AppendCertsFromPEM(caCert) {
+				return nil, fmt.Errorf("failed to parse CA certificate")
+			}
+		}
+		if tc.CAPem != "" {
+			if !caCertPool.AppendCertsFromPEM([]byte(tc.CAPem)) {
+				return nil, fmt.Errorf("failed to parse inline CA certificate")
+			}
 		}
 		tlsConfig.RootCAs = caCertPool
 	}
@@ -852,6 +873,25 @@ func dialAddrFromReq(req *http.Request) string {
 	return req.Header.Get(grafanaDialAddrHeader)
 }
 
+// caPemFromReq returns the per-request CA bundle: the base64-decoded value of the
+// X-Grafana-CA-Pem header (PEM cannot travel raw in a header, it contains
+// newlines), or empty if the header is absent or not valid base64. Like
+// dialAddrFromReq it has no env fallback: a process-wide CA must never leak into
+// a request that didn't ask for it. A malformed value is logged and ignored, so
+// the request falls back to the system roots and fails closed on verification.
+func caPemFromReq(req *http.Request, logger *slog.Logger) string {
+	encoded := req.Header.Get(grafanaCAPemHeader)
+	if encoded == "" {
+		return ""
+	}
+	caPem, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		logger.Warn("Ignoring malformed X-Grafana-CA-Pem header, expected base64-encoded PEM", "error", err)
+		return ""
+	}
+	return string(caPem)
+}
+
 // ExtractGrafanaInfoFromEnv is a StdioContextFunc that extracts Grafana configuration from environment variables.
 // It reads GRAFANA_URL and GRAFANA_SERVICE_ACCOUNT_TOKEN (or deprecated GRAFANA_API_KEY) environment variables and adds the configuration to the context for use by Grafana clients.
 var ExtractGrafanaInfoFromEnv server.StdioContextFunc = func(ctx context.Context) context.Context {
@@ -899,6 +939,16 @@ var ExtractGrafanaInfoFromHeaders httpContextFunc = func(ctx context.Context, re
 	config.BasicAuth = basicAuth
 	config.OrgID = orgID
 	config.DialAddr = dialAddrFromReq(req)
+	if caPem := caPemFromReq(req, logger); caPem != "" {
+		// Copy any process-level TLS settings into a per-request TLSConfig rather
+		// than mutating the shared one, which every other tenant also points at.
+		tlsConfig := TLSConfig{}
+		if config.TLSConfig != nil {
+			tlsConfig = *config.TLSConfig
+		}
+		tlsConfig.CAPem = caPem
+		config.TLSConfig = &tlsConfig
+	}
 	config.ExtraHeaders = mergeHeaders(extraHeadersFromEnv(logger), forwardedHeadersFromRequest(req))
 	return WithGrafanaConfig(ctx, config)
 }

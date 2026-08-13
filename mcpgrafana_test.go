@@ -3,6 +3,7 @@ package mcpgrafana
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
@@ -2263,6 +2264,67 @@ func TestExtractGrafanaInfoFromEnvDialAddr(t *testing.T) {
 	ctx := ExtractGrafanaInfoFromEnv(context.Background())
 	cfg := GrafanaConfigFromContext(ctx)
 	require.Equal(t, "127.0.0.1:39003", cfg.DialAddr)
+}
+
+func TestExtractGrafanaInfoFromHeadersCAPem(t *testing.T) {
+	// A realistic bundle: a leaf-issuing CA plus a root, exactly what a private
+	// PKI hands out. It round-trips through base64 because raw PEM (newlines)
+	// cannot travel in an HTTP header.
+	chain := newTestCAPEM(t, "intermediate-ca") + newTestCAPEM(t, "root-ca")
+
+	newReq := func(t *testing.T, headerValue string) *http.Request {
+		t.Helper()
+		req, err := http.NewRequest("GET", "http://localhost", nil)
+		require.NoError(t, err)
+		if headerValue != "" {
+			req.Header.Set("X-Grafana-CA-Pem", headerValue)
+		}
+		return req
+	}
+
+	t.Run("base64 header round-trips a multi-cert chain", func(t *testing.T) {
+		req := newReq(t, base64.StdEncoding.EncodeToString([]byte(chain)))
+
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		cfg := GrafanaConfigFromContext(ctx)
+		require.NotNil(t, cfg.TLSConfig)
+		require.Equal(t, chain, cfg.TLSConfig.CAPem)
+
+		// The decoded bundle must be usable as-is, both certificates included.
+		tlsCfg, err := cfg.TLSConfig.CreateTLSConfig()
+		require.NoError(t, err)
+		require.NotNil(t, tlsCfg.RootCAs)
+	})
+
+	t.Run("no header leaves the TLS config alone", func(t *testing.T) {
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), newReq(t, ""))
+		require.Nil(t, GrafanaConfigFromContext(ctx).TLSConfig)
+	})
+
+	t.Run("malformed base64 is ignored", func(t *testing.T) {
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), newReq(t, "!!!not-base64!!!"))
+		require.Nil(t, GrafanaConfigFromContext(ctx).TLSConfig)
+	})
+
+	t.Run("keeps process TLS settings without mutating the shared config", func(t *testing.T) {
+		shared := &TLSConfig{CAFile: "/etc/ssl/private-ca.pem", SkipVerify: true}
+		base := WithGrafanaConfig(context.Background(), GrafanaConfig{TLSConfig: shared})
+		req := newReq(t, base64.StdEncoding.EncodeToString([]byte(chain)))
+
+		cfg := GrafanaConfigFromContext(ExtractGrafanaInfoFromHeaders(base, req))
+		require.NotNil(t, cfg.TLSConfig)
+		require.Equal(t, chain, cfg.TLSConfig.CAPem)
+		require.Equal(t, "/etc/ssl/private-ca.pem", cfg.TLSConfig.CAFile)
+		require.True(t, cfg.TLSConfig.SkipVerify)
+		require.Empty(t, shared.CAPem, "the per-request CA must not leak into the shared TLS config")
+	})
+}
+
+func TestExtractGrafanaInfoFromEnvIgnoresCAPemHeader(t *testing.T) {
+	// stdio has no request headers, and the HTTP path must never pick up a
+	// process-wide CA: only -tls-ca-file (process flags) configures CAs there.
+	ctx := ExtractGrafanaInfoFromEnv(context.Background())
+	require.Nil(t, GrafanaConfigFromContext(ctx).TLSConfig)
 }
 
 func TestBuildTransportConfigDialAddr(t *testing.T) {

@@ -28,16 +28,18 @@ type clientCacheKey struct {
 	password         string
 	orgID            int64
 	dialAddr         string
+	caPemHash        string // hash of the per-request CA bundle, so trust config never crosses tenants
 	forwardedHeaders string // sorted, serialized forwarded headers for cache differentiation
 }
 
 // cacheKeyFromRequest builds a clientCacheKey from request-derived credentials and forwarded headers.
-func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64, dialAddr string, req *http.Request) clientCacheKey {
+func cacheKeyFromRequest(grafanaURL, apiKey string, basicAuth *url.Userinfo, orgID int64, dialAddr, caPem string, req *http.Request) clientCacheKey {
 	key := clientCacheKey{
-		url:      grafanaURL,
-		apiKey:   apiKey,
-		orgID:    orgID,
-		dialAddr: dialAddr,
+		url:       grafanaURL,
+		apiKey:    apiKey,
+		orgID:     orgID,
+		dialAddr:  dialAddr,
+		caPemHash: hashCAPem(caPem),
 	}
 	if basicAuth != nil {
 		key.username = basicAuth.Username()
@@ -327,6 +329,27 @@ func hashAPIKey(key string) string {
 	return fmt.Sprintf("%x", h[:4])
 }
 
+// hashCAPem returns a hash of the inline CA bundle for use in the cache key.
+// The full hash (not a truncated one, and not the PEM itself) keeps the key
+// compact while guaranteeing that two tenants sharing a URL and token but
+// trusting different CAs never share a cached client.
+func hashCAPem(caPem string) string {
+	if caPem == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(caPem))
+	return fmt.Sprintf("%x", h)
+}
+
+// caPemFromConfig returns the inline CA bundle carried by the request's TLS
+// configuration, if any.
+func caPemFromConfig(config GrafanaConfig) string {
+	if config.TLSConfig == nil {
+		return ""
+	}
+	return config.TLSConfig.CAPem
+}
+
 // extractGrafanaClientCached creates an httpContextFunc that uses the cache.
 func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 	return func(ctx context.Context, req *http.Request) context.Context {
@@ -337,7 +360,7 @@ func extractGrafanaClientCached(cache *ClientCache) httpContextFunc {
 		}
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, req)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, caPemFromConfig(config), req)
 
 		grafanaClient := cache.GetOrCreateGrafanaClient(key, func() *GrafanaClient {
 			logger.Debug("Creating new Grafana client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))
@@ -355,7 +378,7 @@ func extractIncidentClientCached(cache *ClientCache) httpContextFunc {
 		logger := config.LoggerOrDefault()
 
 		grafanaURL, apiKey, _, orgID := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, config.DialAddr, req)
+		key := cacheKeyFromRequest(grafanaURL, apiKey, nil, orgID, config.DialAddr, caPemFromConfig(config), req)
 
 		incidentClient := cache.GetOrCreateIncidentClient(key, func() *incident.Client {
 			incidentURL := fmt.Sprintf("%s/api/plugins/grafana-irm-app/resources/api/v1/", grafanaURL)
@@ -384,7 +407,7 @@ func extractKubernetesClientCached(cache *ClientCache) httpContextFunc {
 		logger := config.LoggerOrDefault()
 
 		u, apiKey, basicAuth, _ := extractKeyGrafanaInfoFromReq(req, logger)
-		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, req)
+		key := cacheKeyFromRequest(u, apiKey, basicAuth, config.OrgID, config.DialAddr, caPemFromConfig(config), req)
 
 		k8sClient := cache.GetOrCreateK8sClient(key, func() *KubernetesClient {
 			logger.Debug("Creating new Kubernetes client (cache miss)", "url", u, "api_key_hash", hashAPIKey(apiKey))

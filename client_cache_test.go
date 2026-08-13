@@ -1,6 +1,8 @@
 package mcpgrafana
 
 import (
+	"context"
+	"encoding/base64"
 	"net/http"
 	"net/url"
 	"sync"
@@ -141,11 +143,11 @@ func TestClientCache_DifferentCredentials(t *testing.T) {
 }
 
 func TestCacheKeyFromRequest(t *testing.T) {
-	key1 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", nil)
-	key2 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", nil)
+	key1 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", "", nil)
+	key2 := cacheKeyFromRequest("http://localhost:3000", "key1", nil, 1, "", "", nil)
 	assert.Equal(t, key1, key2)
 
-	key3 := cacheKeyFromRequest("http://localhost:3000", "key1", url.UserPassword("admin", "pass"), 1, "", nil)
+	key3 := cacheKeyFromRequest("http://localhost:3000", "key1", url.UserPassword("admin", "pass"), 1, "", "", nil)
 	assert.NotEqual(t, key1, key3)
 
 	assert.Equal(t, "admin", key3.username)
@@ -178,10 +180,69 @@ func TestCacheKeyIncludesDialAddr(t *testing.T) {
 	req, err := http.NewRequest("GET", "http://localhost", nil)
 	require.NoError(t, err)
 
-	k1 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", req)
-	k2 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39002", req)
-	k3 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", req)
+	k1 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", "", req)
+	k2 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39002", "", req)
+	k3 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "127.0.0.1:39001", "", req)
 
 	require.NotEqual(t, k1, k2, "different dial addrs must produce different cache keys")
 	require.Equal(t, k1, k3, "same dial addr must produce the same cache key")
+}
+
+func TestCacheKeyIncludesCAPem(t *testing.T) {
+	req, err := http.NewRequest("GET", "http://localhost", nil)
+	require.NoError(t, err)
+
+	const caA = "-----BEGIN CERTIFICATE-----\ntenant-a\n-----END CERTIFICATE-----\n"
+	const caB = "-----BEGIN CERTIFICATE-----\ntenant-b\n-----END CERTIFICATE-----\n"
+
+	k1 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "", caA, req)
+	k2 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "", caB, req)
+	k3 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "", caA, req)
+	k4 := cacheKeyFromRequest("http://grafana.internal", "key", nil, 0, "", "", req)
+
+	require.NotEqual(t, k1, k2, "different CA bundles must produce different cache keys")
+	require.Equal(t, k1, k3, "same CA bundle must produce the same cache key")
+	require.NotEqual(t, k1, k4, "a CA bundle must not share a key with no CA bundle")
+	require.NotContains(t, k1.caPemHash, "tenant-a", "the key must carry a hash, not the PEM itself")
+	require.Empty(t, k4.caPemHash)
+}
+
+func TestClientCacheSeparatesTenantsByCAPem(t *testing.T) {
+	// Same URL and same token, different private CAs. A cached client is bound to
+	// the trust configuration it was built with, so the two tenants must not share
+	// one — otherwise tenant B silently inherits tenant A's trust config.
+	ts := newTestHTTPServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	})
+
+	cache := NewClientCache(nil)
+	defer cache.Close()
+	extract := extractGrafanaClientCached(cache)
+
+	clientFor := func(caPem string) *GrafanaClient {
+		req, err := http.NewRequest("GET", "http://localhost", nil)
+		require.NoError(t, err)
+		req.Header.Set(grafanaURLHeader, ts.URL)
+		req.Header.Set(grafanaServiceAccountTokenHeader, "shared-token")
+		req.Header.Set(grafanaCAPemHeader, base64.StdEncoding.EncodeToString([]byte(caPem)))
+
+		ctx := ExtractGrafanaInfoFromHeaders(context.Background(), req)
+		return GrafanaClientFromContext(extract(ctx, req))
+	}
+
+	caA := newTestCAPEM(t, "tenant-a-ca")
+	caB := newTestCAPEM(t, "tenant-b-ca")
+
+	clientA := clientFor(caA)
+	clientB := clientFor(caB)
+	clientA2 := clientFor(caA)
+
+	require.NotNil(t, clientA)
+	require.NotNil(t, clientB)
+	require.NotSame(t, clientA, clientB, "tenants with different CAs must not share a cached client")
+	require.Same(t, clientA, clientA2, "the same CA must still hit the cache")
+
+	g, _, _ := cache.Size()
+	require.Equal(t, 2, g)
 }

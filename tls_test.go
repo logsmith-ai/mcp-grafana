@@ -1,9 +1,22 @@
 package mcpgrafana
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +57,127 @@ func TestTLSConfig_CreateTLSConfig(t *testing.T) {
 		_, err := config.CreateTLSConfig()
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to read CA certificate")
+	})
+
+	t.Run("invalid inline CA", func(t *testing.T) {
+		config := &TLSConfig{
+			CAPem: "not a pem",
+		}
+		_, err := config.CreateTLSConfig()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse inline CA certificate")
+	})
+}
+
+// newTestCAPEM generates a self-signed CA certificate, PEM-encoded. Optional
+// extra DNS/IP SANs make it usable as a server certificate as well.
+func newTestCAPEM(t *testing.T, commonName string, ips ...net.IP) string {
+	t.Helper()
+	pemStr, _ := newTestCA(t, commonName, ips...)
+	return pemStr
+}
+
+// newTestCA generates a self-signed CA certificate and returns it both as PEM
+// and as a tls.Certificate that a test server can serve.
+func newTestCA(t *testing.T, commonName string, ips ...net.IP) (string, tls.Certificate) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	require.NoError(t, err)
+
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		IPAddresses:           ips,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return string(pemBytes), tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func TestTLSConfig_CAPemAppendsToSystemRoots(t *testing.T) {
+	caPEM := newTestCAPEM(t, "tenant-ca")
+
+	tlsCfg, err := (&TLSConfig{CAPem: caPEM}).CreateTLSConfig()
+	require.NoError(t, err)
+	require.NotNil(t, tlsCfg.RootCAs)
+
+	// The pool must be "system roots PLUS the tenant CA". Comparing against a
+	// pool holding only the tenant CA is what catches the x509.NewCertPool()
+	// regression, where a tenant's private CA replaced the public roots and
+	// broke every other tenant sharing this process.
+	systemPool, err := x509.SystemCertPool()
+	require.NoError(t, err)
+	expected := systemPool.Clone()
+	require.True(t, expected.AppendCertsFromPEM([]byte(caPEM)))
+	assert.True(t, tlsCfg.RootCAs.Equal(expected), "RootCAs must be the system roots plus the tenant CA")
+
+	tenantOnly := x509.NewCertPool()
+	require.True(t, tenantOnly.AppendCertsFromPEM([]byte(caPEM)))
+	assert.False(t, tlsCfg.RootCAs.Equal(tenantOnly), "the tenant CA must not replace the system roots")
+}
+
+func TestTLSConfig_CAFileAndCAPemBothApplied(t *testing.T) {
+	filePEM := newTestCAPEM(t, "ca-from-file")
+	inlinePEM := newTestCAPEM(t, "ca-from-header")
+
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caFile, []byte(filePEM), 0o600))
+
+	tlsCfg, err := (&TLSConfig{CAFile: caFile, CAPem: inlinePEM}).CreateTLSConfig()
+	require.NoError(t, err)
+	require.NotNil(t, tlsCfg.RootCAs)
+
+	systemPool, err := x509.SystemCertPool()
+	require.NoError(t, err)
+	expected := systemPool.Clone()
+	require.True(t, expected.AppendCertsFromPEM([]byte(filePEM)))
+	require.True(t, expected.AppendCertsFromPEM([]byte(inlinePEM)))
+	assert.True(t, tlsCfg.RootCAs.Equal(expected), "both the CA file and the inline CA must be in the pool")
+}
+
+func TestCAPemVerifiesServerCertificate(t *testing.T) {
+	// A TLS server presenting a certificate issued by "tenant-ca". This is the
+	// production failure: a Grafana with a privately-issued certificate.
+	serverPEM, serverCert := newTestCA(t, "tenant-ca", net.ParseIP("127.0.0.1"))
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	ts.TLS = &tls.Config{Certificates: []tls.Certificate{serverCert}}
+	ts.StartTLS()
+	defer ts.Close()
+
+	get := func(caPEM string) error {
+		transport, err := (&TLSConfig{CAPem: caPEM}).HTTPTransport(http.DefaultTransport.(*http.Transport))
+		require.NoError(t, err)
+		resp, err := (&http.Client{Transport: transport}).Get(ts.URL)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return nil
+	}
+
+	t.Run("the issuing CA verifies the server", func(t *testing.T) {
+		require.NoError(t, get(serverPEM))
+	})
+
+	t.Run("a CA that did not sign the server certificate fails", func(t *testing.T) {
+		otherPEM := newTestCAPEM(t, "other-ca")
+		err := get(otherPEM)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "certificate signed by unknown authority")
 	})
 }
 
