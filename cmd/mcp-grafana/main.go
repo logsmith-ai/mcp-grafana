@@ -61,6 +61,7 @@ var categoryDescription = map[string]string{
 	"sift":          "Sift Investigations: Start and manage Sift investigations, analyze logs/traces, find error patterns, and detect slow requests.",
 	"admin":         "Admin: List teams and perform administrative tasks.",
 	"pyroscope":     "Pyroscope: Profile applications and fetch profiling data.",
+	"tempo":         "Tempo: Discover trace tags and their values, search traces with TraceQL, and fetch full traces.",
 	"navigation":    "Navigation: Generate deeplink URLs for Grafana resources like dashboards, panels, and Explore queries, with optional built-in shortening.",
 	"annotations":   "Annotations: Create and manage dashboard annotations.",
 	"rendering":     "Rendering: Export dashboard panels or full dashboards as PNG images (requires Grafana Image Renderer plugin).",
@@ -85,7 +86,7 @@ type disabledTools struct {
 	search, datasource, incident,
 	prometheus, loki, elasticsearch, quickwit, influxdb, alerting,
 	dashboard, folder, oncall, asserts, sift, admin,
-	pyroscope, navigation, proxied, annotations, rendering, cloudwatch, write,
+	pyroscope, tempo, navigation, proxied, annotations, rendering, cloudwatch, write,
 	snapshot, examples, clickhouse, snowflake, graphite,
 	runpanelquery, athena, plugin, api, config, provisioning bool
 }
@@ -106,7 +107,7 @@ type grafanaConfig struct {
 }
 
 func (dt *disabledTools) addFlags() {
-	flag.StringVar(&dt.enabledTools, "enabled-tools", "search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning", "A comma separated list of tools enabled for this server. Can be overwritten entirely or by disabling specific components, e.g. --disable-search.")
+	flag.StringVar(&dt.enabledTools, "enabled-tools", "search,datasource,incident,prometheus,loki,alerting,dashboard,folder,oncall,asserts,sift,pyroscope,tempo,navigation,proxied,annotations,rendering,snapshot,plugin,api,config,provisioning", "A comma separated list of tools enabled for this server. Can be overwritten entirely or by disabling specific components, e.g. --disable-search.")
 	flag.BoolVar(&dt.search, "disable-search", false, "Disable search tools")
 	flag.BoolVar(&dt.datasource, "disable-datasource", false, "Disable datasource tools")
 	flag.BoolVar(&dt.incident, "disable-incident", false, "Disable incident tools")
@@ -123,6 +124,7 @@ func (dt *disabledTools) addFlags() {
 	flag.BoolVar(&dt.sift, "disable-sift", false, "Disable sift tools")
 	flag.BoolVar(&dt.admin, "disable-admin", false, "Disable admin tools")
 	flag.BoolVar(&dt.pyroscope, "disable-pyroscope", false, "Disable pyroscope tools")
+	flag.BoolVar(&dt.tempo, "disable-tempo", false, "Disable tempo tools")
 	flag.BoolVar(&dt.navigation, "disable-navigation", false, "Disable navigation tools")
 	flag.BoolVar(&dt.proxied, "disable-proxied", false, "Disable proxied tools (tools from external MCP servers)")
 	flag.BoolVar(&dt.write, "disable-write", false, "Disable write tools (create/update operations)")
@@ -184,6 +186,7 @@ func (dt *disabledTools) toolEntries() []toolEntry {
 		{func(mcp *server.MCPServer) { tools.AddSiftTools(mcp, enableWriteTools) }, dt.sift, "sift"},
 		{tools.AddAdminTools, dt.admin, "admin"},
 		{tools.AddPyroscopeTools, dt.pyroscope, "pyroscope"},
+		{tools.AddTempoTools, dt.tempo, "tempo"},
 		{func(mcp *server.MCPServer) { tools.AddNavigationTools(mcp, enableWriteTools) }, dt.navigation, "navigation"},
 		{func(mcp *server.MCPServer) { tools.AddAnnotationTools(mcp, enableWriteTools) }, dt.annotations, "annotations"},
 		{tools.AddRenderingTools, dt.rendering, "rendering"},
