@@ -29,7 +29,11 @@ const (
 	// everything. Five minutes matches the window this tool has always used.
 	defaultTempoSearchWindow = 5 * time.Minute
 
-	tempoMaxAttempts    = 5
+	// Three attempts sleep 1s + 2s at most. The gateway calls this tool over MCP
+	// with a 30s client timeout (mcpHttpClient.ts), so a longer ladder risks the
+	// caller abandoning the request mid-retry while this process keeps working on
+	// it. Raise the timeout there before raising this.
+	tempoMaxAttempts    = 3
 	tempoRetryBaseDelay = 1 * time.Second
 	tempoRetryMaxDelay  = 8 * time.Second
 )
@@ -87,10 +91,11 @@ func (c *tempoClient) get(ctx context.Context, rawURL string) (*http.Response, e
 	return c.httpClient.Do(req)
 }
 
-// getWithRetry is the same policy the gateway applied to trace search and trace
-// fetch before these tools moved here: up to 5 attempts with exponential backoff
-// (1s base, 8s cap), honouring Retry-After. A response that is still retryable on
-// the final attempt is returned as-is, so the caller reports the real status.
+// getWithRetry carries the retry the gateway applied to trace search and trace
+// fetch before these tools moved here: exponential backoff from a 1s base, capped
+// at 8s, honouring Retry-After, over tempoMaxAttempts tries. A response that is
+// still retryable on the final attempt is returned as-is, so the caller reports
+// the real status rather than a synthesised one.
 func (c *tempoClient) getWithRetry(ctx context.Context, rawURL string) (*http.Response, error) {
 	for attempt := 1; ; attempt++ {
 		resp, err := c.get(ctx, rawURL)
